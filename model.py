@@ -10,6 +10,9 @@ import os
 from PIL import Image
 import matplotlib.pyplot as plt
 
+from sklearn.model_selection import StratifiedShuffleSplit
+import numpy as np
+
 # DEVICE
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -27,14 +30,25 @@ train_transforms = transforms.Compose([
 train_dir = "data/brain_mri/Training"
 test_dir = "data/brain_mri/Testing"
 
-# train data (80 train, 20 val)
+# train data (80 train, 20 val) --> try stratified splitting
 full_train_dataset = ImageFolder(train_dir, transform=train_transforms)
-train_size = int(0.8 * len(full_train_dataset))
-val_size = len(full_train_dataset) - train_size
-train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+targets = np.array(full_train_dataset.targets)
+
+splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+train_idx, val_idx = next(splitter.split(np.zeros(len(targets)), targets))
+
+# Create subset datasets using indices
+from torch.utils.data import Subset
+
+train_dataset = Subset(full_train_dataset, train_idx)
+val_dataset = Subset(full_train_dataset, val_idx)
 
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+
 
 # test data
 test_dataset = ImageFolder(test_dir, transform=train_transforms)
@@ -47,7 +61,8 @@ model = model.to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-train_model = False
+# TOGGLE FOR NEW MODEL / LOAD OLD MODEL
+train_model = True
 
 # TRAINING
 epochs = 5
@@ -116,33 +131,28 @@ with torch.no_grad():
 
 print(f"Test Accuracy: {100 * correct / total:.2f}%")
 
+# IMPROVE MODEL TESTS: 
 class_names = test_dataset.classes
 misclassified = []
 
-model.eval()
+correct_per_class = [0] * len(class_names)
+total_per_class = [0] * len(class_names)
+
 with torch.no_grad():
-    for idx, (images, labels) in enumerate(test_loader):
+    for images, labels in test_loader:
         images, labels = images.to(device), labels.to(device)
         outputs = model(images)
         _, predicted = torch.max(outputs, 1)
         
-        # For each item in the batch:
-        for i in range(images.size(0)):
-            if predicted[i] != labels[i]:
-                # Record info: index in dataset, predicted and true label
-                dataset_idx = idx * test_loader.batch_size + i
-                misclassified.append((dataset_idx, predicted[i].item(), labels[i].item()))
+        for label, pred in zip(labels, predicted):
+            total_per_class[label.item()] += 1
+            if label == pred:
+                correct_per_class[label.item()] += 1
 
-print(f"Total misclassified samples: {len(misclassified)}")
-
-# Optionally visualize some misclassified samples:
-num_to_show = min(5, len(misclassified))
-
-for sample in misclassified[:num_to_show]:
-    idx, pred_label, true_label = sample
-    img_path, _ = test_dataset.samples[idx]  # get path from ImageFolder dataset
-    img = Image.open(img_path)
-    plt.imshow(img)
-    plt.title(f"True: {class_names[true_label]} | Predicted: {class_names[pred_label]}")
-    plt.axis('off')
-    plt.show()
+print("Class-wise accuracy:")
+for i, class_name in enumerate(class_names):
+    if total_per_class[i] > 0:
+        acc = 100 * correct_per_class[i] / total_per_class[i]
+        print(f"{class_name}: {acc:.2f}% ({correct_per_class[i]}/{total_per_class[i]})")
+    else:
+        print(f"{class_name}: No samples in test set")
