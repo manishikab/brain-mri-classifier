@@ -1,29 +1,96 @@
 import torch
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision.datasets import ImageFolder
+import timm
 
-# PREPARE DATASET
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
 
-# ImageNet mean and std:
-normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+# PRE
 
-train_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    normalize
+#Pytorch Dataset
+class BrainScanDataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        self.data = ImageFolder(data_dir, transform=transform)
+
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+    
+    def classes(self):
+        return self.data.classes
+    
+
+transform = transforms.Compose([
+    transforms.Resize((128,128)),
+    transforms.ToTensor()
 ])
 
-test_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    normalize
-])
+data_dir="data/brain_mri/Training"
+dataset = BrainScanDataset(data_dir, transform=transform)
 
-train_data = datasets.ImageFolder(root= 'data/brain_mri/Training', transform=train_transforms)
-test_data = datasets.ImageFolder(root='data/brain_mri/Testing', transform=test_transforms)
+# Dataloader (batching)
+dataloader = DataLoader(dataset, batch_size=32, shuffle = True)
 
-train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
+# Pytorch Model
+class SimpleScanClassifier(nn.Module):
+    def __init__(self, num_classes = 4):
+        super(SimpleScanClassifier, self).__init__()
 
-# Check dataset class names
-print("Classes:", train_data.classes)
+        self.base_model = timm.create_model("efficientnet_b0", pretrained=True)
+        self.features = nn.Sequential(*list(self.base_model.children())[:-1])
+        enet_out_size = 1280
+
+        #Make Classifier
+        self.classifier = nn.Linear(enet_out_size, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        output = self.classifier(x)
+        return output
+    
+# TRAINING
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = SimpleScanClassifier(num_classes=4)
+model.to(device)
+
+#Loss Function
+criterion = nn.CrossEntropyLoss()
+# Optimizer
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# already in the prev code FIXME?
+train_folder = data_dir
+train_dataset = dataset
+train_loader = dataloader
+
+num_epochs = 5
+train_losses = []
+
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * images.size(0)
+    train_loss = running_loss / len(train_loader.dataset)
+    train_losses.append(train_loss)
+
+    print(f"Epoch {epoch+1}/{num_epochs} - Train loss: {train_loss:.4f}")
+
+# torch.save(model.state_dict(), "brain_scan_model.pth")
+# print("Model saved!")
