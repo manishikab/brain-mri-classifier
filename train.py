@@ -1,196 +1,179 @@
-import os
+"""Train leakage-safe binary and multi-class Brain MRI baselines."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import timm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torchvision.datasets import ImageFolder
-import torchvision.transforms as transforms
-import timm
-import numpy as np
-from sklearn.model_selection import train_test_split
-from collections import Counter
-from PIL import Image
+from torch.utils.data import DataLoader
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+from data import RemappedDataset, make_datasets, make_label_maps
 
-train_dir = "data/brain_mri/Training"
-test_dir = "data/brain_mri/Testing"
+SEED, BATCH_SIZE, EPOCHS, PATIENCE = 42, 32, 20, 4
 
-# Load dataset
-train_dataset_raw = ImageFolder(train_dir)
-test_dataset_raw = ImageFolder(test_dir)
-all_samples = train_dataset_raw.samples + test_dataset_raw.samples
 
-# Convert data for DataLoader
-class MergedDataset(Dataset):
-    def __init__(self, samples, transform=None):
-        self.samples = samples
-        self.transform = transform
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    def __len__(self):
-        return len(self.samples)
 
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        img = Image.open(path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img, label
+def accuracy(model, loader, device):
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for images, labels in loader:
+            predictions = model(images.to(device)).argmax(dim=1)
+            labels = labels.to(device)
+            correct += (predictions == labels).sum().item()
+            total += labels.size(0)
+    return correct / total
 
-# Transforms
-normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
 
-train_transforms = transforms.Compose([
-    transforms.Resize(236),
-    transforms.CenterCrop(224),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(15),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
-    transforms.ToTensor(),
-    normalize
-])
-
-test_transforms = transforms.Compose([
-    transforms.Resize(236),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    normalize
-])
-
-# Stratified split into train/val/test
-all_labels = [label for _, label in all_samples]
-train_val_idx, test_idx = train_test_split(
-    range(len(all_samples)),
-    # 10% of data goes to the test set
-    test_size=0.1,
-    # test set has same class proportions as the full dataset.
-    stratify=all_labels,
-    random_state=42
-)
-train_idx, val_idx = train_test_split(
-    train_val_idx,
-    # 10% of total becomes validation.
-    test_size=0.1111,
-    # class balance again
-    stratify=[all_labels[i] for i in train_val_idx],
-    random_state=42
-)
-
-train_dataset = MergedDataset([all_samples[i] for i in train_idx], transform=train_transforms)
-val_dataset = MergedDataset([all_samples[i] for i in val_idx], transform=test_transforms)
-test_dataset = MergedDataset([all_samples[i] for i in test_idx], transform=test_transforms)
-
-# ----------------------
-# Binary dataset
-# ----------------------
-
-# 0: no tumor or 1: tumor
-def to_binary_label(label):
-    return 0 if label == 2 else 1
-
-class BinaryLabelDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-    def __len__(self):
-        return len(self.dataset)
-    def __getitem__(self, idx):
-        img, label = self.dataset[idx]
-        return img, to_binary_label(label)
-
-binary_train_loader = DataLoader(BinaryLabelDataset(train_dataset), batch_size=32, shuffle=True)
-binary_val_loader = DataLoader(BinaryLabelDataset(val_dataset), batch_size=32, shuffle = False)
-binary_test_loader = DataLoader(BinaryLabelDataset(test_dataset), batch_size=32, shuffle = False)
-
-# ----------------------
-# Multi-class tumor dataset
-# ----------------------
-
-# original: 0: glioma, 1: meningioma, 3: pituitary
-tumor_classes = [0, 1, 3]
-
-class TumorRemapDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-        # updated: 0: glioma, 1: meningioma, 2: pituitary
-        self.label_map = {0:0, 1:1, 3:2}
-        # filters out all no tumor samples
-        self.indices = [i for i in range(len(dataset)) if dataset[i][1] in tumor_classes]
-    def __len__(self):
-        return len(self.indices)
-    def __getitem__(self, idx):
-        img, label = self.dataset[self.indices[idx]]
-        return img, self.label_map[label]
-
-tumor_train_loader = DataLoader(TumorRemapDataset(train_dataset), batch_size=32, shuffle=True)
-tumor_val_loader = DataLoader(TumorRemapDataset(val_dataset), batch_size=32)
-tumor_test_loader = DataLoader(TumorRemapDataset(test_dataset), batch_size=32)
-
-# ----------------------
-# Models
-# ----------------------
-
-# 1. Binary model (ResNet34) to detect whether a tumor exists or not.
-# 2. Multi-class model (ConvNeXt) to classify the type of tumor (glioma, meningioma, pituitary)
-binary_model = timm.create_model('resnet34', pretrained=True, num_classes=2).to(device)
-multi_model = timm.create_model('convnext_base', pretrained=True, num_classes=3).to(device)
-
-# Class weights for multi-class
-labels_multi = [label for _, label in TumorRemapDataset(train_dataset)]
-counts = Counter(labels_multi)
-total = len(labels_multi)
-weights = [total / (3 * counts[i]) for i in range(3)]
-weights[0] *= 1.3  # boost glioma
-weights = torch.tensor(weights).float().to(device)
-
-# Loss & optimizer
-# weight decay to prevent overfitting
-bin_criterion = nn.CrossEntropyLoss()
-bin_optimizer = optim.AdamW(binary_model.parameters(), lr=.0001, weight_decay=1e-4)
-
-multi_criterion = nn.CrossEntropyLoss(weight=weights)
-multi_optimizer = optim.AdamW(multi_model.parameters(), lr=.00003, weight_decay=1e-4)
-
-# ----------------------
-# Training
-# ----------------------
-def train_model(model, criterion, optimizer, train_loader, val_loader, epochs, save_path):
-    best_acc = 0
-    for epoch in range(epochs):
+def train_model(model, criterion, optimizer, train_loader, validation_loader, name, output_dir, device):
+    best_validation, best_epoch, stale_epochs = -1.0, None, 0
+    history = []
+    for epoch in range(1, EPOCHS + 1):
         model.train()
-        total_loss = 0
-        # x: batch of images, y: labels
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+        running_loss = 0.0
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
-            out = model(x)
-            loss = criterion(out, y)
+            loss = criterion(model(images), labels)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-        val_acc = evaluate(model, val_loader)
-        print(f"[{epoch+1}/{epochs}] Train Loss: {total_loss/len(train_loader):.4f}, Val Acc: {val_acc:.2f}%")
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), save_path)
-            print(f"✅ Best model saved ({best_acc:.2f}%)")
+            running_loss += loss.item()
+        validation_accuracy = accuracy(model, validation_loader, device)
+        record = {
+            "epoch": epoch,
+            "train_loss": running_loss / len(train_loader),
+            "validation_accuracy": validation_accuracy,
+        }
+        history.append(record)
+        print(
+            f"{name} epoch {epoch:02d}: loss={record['train_loss']:.4f}, "
+            f"validation accuracy={validation_accuracy:.3%}"
+        )
+        if validation_accuracy > best_validation:
+            best_validation, best_epoch, stale_epochs = validation_accuracy, epoch, 0
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "best_epoch": best_epoch,
+                    "best_validation_accuracy": best_validation,
+                    "seed": SEED,
+                },
+                output_dir / f"{name}_best.pt",
+            )
+        else:
+            stale_epochs += 1
+            if stale_epochs >= PATIENCE:
+                print(f"{name}: early stopping after epoch {epoch}.")
+                break
+    with (output_dir / f"{name}_history.json").open("w") as file:
+        json.dump(history, file, indent=2)
+    return {"best_epoch": best_epoch, "best_validation_accuracy": best_validation}
 
-def evaluate(model, loader):
-    model.eval()
-    correct, total = 0, 0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            out = model(x)
-            _, pred = torch.max(out, 1)
-            total += y.size(0)
-            correct += (pred == y).sum().item()
-    return 100 * correct / total
 
-print("Training binary model")
-train_model(binary_model, bin_criterion, bin_optimizer, binary_train_loader, binary_val_loader, epochs=30, save_path="binary_model_best.pth")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", default="data/brain_mri")
+    parser.add_argument("--output-dir", default="artifacts")
+    args = parser.parse_args()
+    set_seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Using device: {device}")
 
-print("Training multi-class model")
-train_model(multi_model, multi_criterion, multi_optimizer, tumor_train_loader, tumor_val_loader, epochs=30, save_path="multi_class_model_best.pth")
+    train_dataset, validation_dataset, _, class_to_idx, split_audit = make_datasets(
+        args.data_root, seed=SEED, return_audit=True
+    )
+    binary_map, tumor_map = make_label_maps(class_to_idx)
+    loader_args = {
+        "batch_size": BATCH_SIZE,
+        "num_workers": 2,
+        "pin_memory": device.type == "cuda",
+    }
+    binary_train = RemappedDataset(train_dataset, binary_map)
+    binary_validation = RemappedDataset(validation_dataset, binary_map)
+    tumor_train = RemappedDataset(train_dataset, tumor_map)
+    tumor_validation = RemappedDataset(validation_dataset, tumor_map)
+    binary_train_loader = DataLoader(binary_train, shuffle=True, **loader_args)
+    binary_validation_loader = DataLoader(binary_validation, **loader_args)
+    tumor_train_loader = DataLoader(tumor_train, shuffle=True, **loader_args)
+    tumor_validation_loader = DataLoader(tumor_validation, **loader_args)
+
+    binary_model = timm.create_model(
+        "resnet34", pretrained=True, num_classes=2
+    ).to(device)
+    binary_best = train_model(
+        binary_model,
+        nn.CrossEntropyLoss(),
+        optim.AdamW(binary_model.parameters(), lr=1e-4, weight_decay=1e-4),
+        binary_train_loader,
+        binary_validation_loader,
+        "binary_model",
+        output_dir,
+        device,
+    )
+
+    tumor_counts = Counter(
+        tumor_train.dataset.labels[index] for index in tumor_train.indices
+    )
+    total_tumor_images = sum(tumor_counts.values())
+    weights = torch.tensor(
+        [
+            total_tumor_images / (len(tumor_map) * tumor_counts[label])
+            for label in tumor_map
+        ],
+        dtype=torch.float,
+        device=device,
+    )
+    multi_model = timm.create_model(
+        "convnext_base", pretrained=True, num_classes=3
+    ).to(device)
+    multi_best = train_model(
+        multi_model,
+        nn.CrossEntropyLoss(weight=weights),
+        optim.AdamW(multi_model.parameters(), lr=3e-5, weight_decay=1e-4),
+        tumor_train_loader,
+        tumor_validation_loader,
+        "multi_class_model",
+        output_dir,
+        device,
+    )
+
+    audit = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "seed": SEED,
+        "configuration": {
+            "batch_size": BATCH_SIZE,
+            "maximum_epochs": EPOCHS,
+            "early_stopping_patience": PATIENCE,
+            "binary_architecture": "resnet34",
+            "multi_class_architecture": "convnext_base",
+        },
+        "split": split_audit,
+        "best_validation": {"binary": binary_best, "multi_class": multi_best},
+    }
+    with (output_dir / "training_audit.json").open("w") as file:
+        json.dump(audit, file, indent=2)
+    print(f"Saved checkpoints, histories, and audit to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
